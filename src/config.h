@@ -56,7 +56,7 @@
 #endif
 
 /* Test for backtrace() */
-#if defined(__APPLE__) || defined(__linux__) || defined(__sun)
+#if defined(__APPLE__) || defined(__linux__)
 #define HAVE_BACKTRACE 1
 #endif
 
@@ -105,6 +105,20 @@
 #define rdb_fsync_range(fd,off,size) fsync(fd)
 #endif
 
+/* Check if we can use setproctitle().
+ * BSD systems have support for it, we provide an implementation for
+ * Linux and osx. */
+#if (defined __NetBSD__ || defined __FreeBSD__ || defined __OpenBSD__)
+#define USE_SETPROCTITLE
+#endif
+
+#if (defined __linux || defined __APPLE__)
+#define USE_SETPROCTITLE
+#define INIT_SETPROCTITLE_REPLACEMENT
+void spt_init(int argc, char *argv[]);
+void setproctitle(const char *fmt, ...);
+#endif
+
 /* Byte ordering detection */
 #include <sys/types.h> /* This will likely define BYTE_ORDER */
 
@@ -139,11 +153,25 @@
 #endif /* BSD */
 #endif /* BYTE_ORDER */
 
-#if defined(__BYTE_ORDER) && !defined(BYTE_ORDER)
+/* Sometimes after including an OS-specific header that defines the
+ * endianess we end with __BYTE_ORDER but not with BYTE_ORDER that is what
+ * the Redis code uses. In this case let's define everything without the
+ * underscores. */
+#ifndef BYTE_ORDER
+#ifdef __BYTE_ORDER
+#if defined(__LITTLE_ENDIAN) && defined(__BIG_ENDIAN)
+#ifndef LITTLE_ENDIAN
+#define LITTLE_ENDIAN __LITTLE_ENDIAN
+#endif
+#ifndef BIG_ENDIAN
+#define BIG_ENDIAN __BIG_ENDIAN
+#endif
 #if (__BYTE_ORDER == __LITTLE_ENDIAN)
 #define BYTE_ORDER LITTLE_ENDIAN
 #else
 #define BYTE_ORDER BIG_ENDIAN
+#endif
+#endif
 #endif
 #endif
 
@@ -163,6 +191,5 @@
 #define HAVE_ATOMIC
 #endif
 #endif
-
 
 #endif

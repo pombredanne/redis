@@ -1,5 +1,13 @@
-/*
- * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
+/* redisassert.h -- Drop in replacemnet assert.h that prints the stack trace
+ *                  in the Redis logs.
+ *
+ * This file should be included instead of "assert.h" inside libraries used by
+ * Redis that are using assertions, so instead of Redis disappearing with
+ * SIGABORT, we get the details and stack trace inside the log file.
+ *
+ * ----------------------------------------------------------------------------
+ *
+ * Copyright (c) 2006-2012, Salvatore Sanfilippo <antirez at gmail dot com>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -27,26 +35,13 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-/* Every time the Redis Git SHA1 or Dirty status changes only this small 
- * file is recompiled, as we access this information in all the other
- * files using this functions. */
+#ifndef __REDIS_ASSERT_H__
+#define __REDIS_ASSERT_H__
 
-#include <string.h>
+#include <unistd.h> /* for _exit() */
 
-#include "release.h"
-#include "version.h"
-#include "crc64.h"
+#define assert(_e) ((_e)?(void)0 : (_redisAssert(#_e,__FILE__,__LINE__),_exit(1)))
 
-char *redisGitSHA1(void) {
-    return REDIS_GIT_SHA1;
-}
+void _redisAssert(char *estr, char *file, int line);
 
-char *redisGitDirty(void) {
-    return REDIS_GIT_DIRTY;
-}
-
-uint64_t redisBuildId(void) {
-    char *buildid = REDIS_VERSION REDIS_BUILD_ID REDIS_GIT_DIRTY REDIS_GIT_SHA1;
-
-    return crc64(0,(unsigned char*)buildid,strlen(buildid));
-}
+#endif

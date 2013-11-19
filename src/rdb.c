@@ -99,7 +99,7 @@ int rdbSaveLen(rio *rdb, uint32_t len) {
         buf[0] = (REDIS_RDB_32BITLEN<<6);
         if (rdbWriteRaw(rdb,buf,1) == -1) return -1;
         len = htonl(len);
-        if (rdbWriteRaw(rdb,&len,4) == -4) return -1;
+        if (rdbWriteRaw(rdb,&len,4) == -1) return -1;
         nwritten = 1+4;
     }
     return nwritten;
@@ -265,7 +265,7 @@ err:
     return NULL;
 }
 
-/* Save a string objet as [len][data] on disk. If the object is a string
+/* Save a string object as [len][data] on disk. If the object is a string
  * representation of an integer value we try to save it in a special form */
 int rdbSaveRawString(rio *rdb, unsigned char *s, size_t len) {
     int enclen;
@@ -321,11 +321,11 @@ int rdbSaveLongLongAsStringObject(rio *rdb, long long value) {
 /* Like rdbSaveStringObjectRaw() but handle encoded objects */
 int rdbSaveStringObject(rio *rdb, robj *obj) {
     /* Avoid to decode the object, then encode it again, if the
-     * object is alrady integer encoded. */
+     * object is already integer encoded. */
     if (obj->encoding == REDIS_ENCODING_INT) {
         return rdbSaveLongLongAsStringObject(rdb,(long)obj->ptr);
     } else {
-        redisAssertWithInfo(NULL,obj,obj->encoding == REDIS_ENCODING_RAW);
+        redisAssertWithInfo(NULL,obj,sdsEncodedObject(obj));
         return rdbSaveRawString(rdb,obj->ptr,sdslen(obj->ptr));
     }
 }
@@ -367,7 +367,7 @@ robj *rdbLoadEncodedStringObject(rio *rdb) {
 }
 
 /* Save a double value. Doubles are saved as strings prefixed by an unsigned
- * 8 bit integer specifing the length of the representation.
+ * 8 bit integer specifying the length of the representation.
  * This 8 bit integer has special values in order to specify the following
  * conditions:
  * 253: not a number
@@ -606,7 +606,7 @@ off_t rdbSavedObjectLen(robj *o) {
 
 /* Save a key-value pair, with expire time, type, key, value.
  * On error -1 is returned.
- * On success if the key was actaully saved 1 is returned, otherwise 0
+ * On success if the key was actually saved 1 is returned, otherwise 0
  * is returned (the key was already expired). */
 int rdbSaveKeyValuePair(rio *rdb, robj *key, robj *val,
                         long long expiretime, long long now)
@@ -722,21 +722,22 @@ int rdbSaveBackground(char *filename) {
     if (server.rdb_child_pid != -1) return REDIS_ERR;
 
     server.dirty_before_bgsave = server.dirty;
+    server.lastbgsave_try = time(NULL);
 
     start = ustime();
     if ((childpid = fork()) == 0) {
         int retval;
 
         /* Child */
-        if (server.ipfd > 0) close(server.ipfd);
-        if (server.sofd > 0) close(server.sofd);
+        closeListeningSockets(0);
+        redisSetProcTitle("redis-rdb-bgsave");
         retval = rdbSave(filename);
         if (retval == REDIS_OK) {
             size_t private_dirty = zmalloc_get_private_dirty();
 
             if (private_dirty) {
                 redisLog(REDIS_NOTICE,
-                    "RDB: %lu MB of memory used by copy-on-write",
+                    "RDB: %zu MB of memory used by copy-on-write",
                     private_dirty/(1024*1024));
             }
         }
@@ -745,6 +746,7 @@ int rdbSaveBackground(char *filename) {
         /* Parent */
         server.stat_fork_time = ustime()-start;
         if (childpid == -1) {
+            server.lastbgsave_status = REDIS_ERR;
             redisLog(REDIS_WARNING,"Can't save in background: fork: %s",
                 strerror(errno));
             return REDIS_ERR;
@@ -772,7 +774,6 @@ robj *rdbLoadObject(int rdbtype, rio *rdb) {
     size_t len;
     unsigned int i;
 
-    redisLog(REDIS_DEBUG,"LOADING OBJECT %d (at %d)\n",rdbtype,rioTell(rdb));
     if (rdbtype == REDIS_RDB_TYPE_STRING) {
         /* Read string value */
         if ((o = rdbLoadEncodedStringObject(rdb)) == NULL) return NULL;
@@ -795,7 +796,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb) {
             /* If we are using a ziplist and the value is too big, convert
              * the object to a real list. */
             if (o->encoding == REDIS_ENCODING_ZIPLIST &&
-                ele->encoding == REDIS_ENCODING_RAW &&
+                sdsEncodedObject(ele) &&
                 sdslen(ele->ptr) > server.list_max_ziplist_value)
                     listTypeConvert(o,REDIS_ENCODING_LINKEDLIST);
 
@@ -869,9 +870,8 @@ robj *rdbLoadObject(int rdbtype, rio *rdb) {
             if (rdbLoadDoubleValue(rdb,&score) == -1) return NULL;
 
             /* Don't care about integer-encoded strings. */
-            if (ele->encoding == REDIS_ENCODING_RAW &&
-                sdslen(ele->ptr) > maxelelen)
-                    maxelelen = sdslen(ele->ptr);
+            if (sdsEncodedObject(ele) && sdslen(ele->ptr) > maxelelen)
+                maxelelen = sdslen(ele->ptr);
 
             znode = zslInsert(zs->zsl,score,ele);
             dictAdd(zs->dict,ele,&znode->score);
@@ -903,10 +903,10 @@ robj *rdbLoadObject(int rdbtype, rio *rdb) {
             /* Load raw strings */
             field = rdbLoadStringObject(rdb);
             if (field == NULL) return NULL;
-            redisAssert(field->encoding == REDIS_ENCODING_RAW);
+            redisAssert(sdsEncodedObject(field));
             value = rdbLoadStringObject(rdb);
             if (value == NULL) return NULL;
-            redisAssert(field->encoding == REDIS_ENCODING_RAW);
+            redisAssert(sdsEncodedObject(value));
 
             /* Add pair to ziplist */
             o->ptr = ziplistPush(o->ptr, field->ptr, sdslen(field->ptr), ZIPLIST_TAIL);
@@ -1057,24 +1057,32 @@ void stopLoading(void) {
     server.loading = 0;
 }
 
+/* Track loading progress in order to serve client's from time to time
+   and if needed calculate rdb checksum  */
+void rdbLoadProgressCallback(rio *r, const void *buf, size_t len) {
+    if (server.rdb_checksum)
+        rioGenericUpdateChecksum(r, buf, len);
+    if (server.loading_process_events_interval_bytes &&
+        (r->processed_bytes + len)/server.loading_process_events_interval_bytes > r->processed_bytes/server.loading_process_events_interval_bytes) {
+        loadingProgress(r->processed_bytes);
+        aeProcessEvents(server.el, AE_FILE_EVENTS|AE_DONT_WAIT);
+    }
+}
+
 int rdbLoad(char *filename) {
     uint32_t dbid;
     int type, rdbver;
     redisDb *db = server.db+0;
     char buf[1024];
     long long expiretime, now = mstime();
-    long loops = 0;
     FILE *fp;
     rio rdb;
 
-    fp = fopen(filename,"r");
-    if (!fp) {
-        errno = ENOENT;
-        return REDIS_ERR;
-    }
+    if ((fp = fopen(filename,"r")) == NULL) return REDIS_ERR;
+
     rioInitWithFile(&rdb,fp);
-    if (server.rdb_checksum)
-        rdb.update_cksum = rioGenericUpdateChecksum;
+    rdb.update_cksum = rdbLoadProgressCallback;
+    rdb.max_processing_chunk = server.loading_process_events_interval_bytes;
     if (rioRead(&rdb,buf,9) == 0) goto eoferr;
     buf[9] = '\0';
     if (memcmp(buf,"REDIS",5) != 0) {
@@ -1096,12 +1104,6 @@ int rdbLoad(char *filename) {
         robj *key, *val;
         expiretime = -1;
 
-        /* Serve the clients from time to time */
-        if (!(loops++ % 1000)) {
-            loadingProgress(rioTell(&rdb));
-            aeProcessEvents(server.el, AE_FILE_EVENTS|AE_DONT_WAIT);
-        }
-
         /* Read type. */
         if ((type = rdbLoadType(&rdb)) == -1) goto eoferr;
         if (type == REDIS_RDB_OPCODE_EXPIRETIME) {
@@ -1109,7 +1111,7 @@ int rdbLoad(char *filename) {
             /* We read the time so we need to read the object type again. */
             if ((type = rdbLoadType(&rdb)) == -1) goto eoferr;
             /* the EXPIRETIME opcode specifies time in seconds, so convert
-             * into milliesconds. */
+             * into milliseconds. */
             expiretime *= 1000;
         } else if (type == REDIS_RDB_OPCODE_EXPIRETIME_MS) {
             /* Milliseconds precision expire times introduced with RDB
@@ -1194,7 +1196,10 @@ void backgroundSaveDoneHandler(int exitcode, int bysignal) {
         redisLog(REDIS_WARNING,
             "Background saving terminated by signal %d", bysignal);
         rdbRemoveTempFile(server.rdb_child_pid);
-        server.lastbgsave_status = REDIS_ERR;
+        /* SIGUSR1 is whitelisted, so we have a way to kill a child without
+         * tirggering an error conditon. */
+        if (bysignal != SIGUSR1)
+            server.lastbgsave_status = REDIS_ERR;
     }
     server.rdb_child_pid = -1;
     server.rdb_save_time_last = time(NULL)-server.rdb_save_time_start;
