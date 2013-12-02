@@ -260,6 +260,8 @@ void clusterInit(void) {
     server.cluster->state = REDIS_CLUSTER_FAIL;
     server.cluster->size = 1;
     server.cluster->nodes = dictCreate(&clusterNodesDictType,NULL);
+    server.cluster->nodes_black_list =
+        dictCreate(&clusterNodesBlackListDictType,NULL);
     server.cluster->failover_auth_time = 0;
     server.cluster->failover_auth_count = 0;
     server.cluster->failover_auth_epoch = 0;
@@ -618,6 +620,75 @@ void clusterRenameNode(clusterNode *node, char *newname) {
     redisAssert(retval == DICT_OK);
     memcpy(node->name, newname, REDIS_CLUSTER_NAMELEN);
     clusterAddNode(node);
+}
+
+/* -----------------------------------------------------------------------------
+ * CLUSTER nodes blacklist
+ *
+ * The nodes blacklist is just a way to ensure that a given node with a given
+ * Node ID is not readded before some time elapsed (this time is specified
+ * in seconds in REDIS_CLUSTER_BLACKLIST_TTL).
+ *
+ * This is useful when we want to remove a node from the cluster completely:
+ * when CLUSTER FORGET is called, it also puts the node into the blacklist so
+ * that even if we receive gossip messages from other nodes that still remember
+ * about the node we want to remove, we don't re-add it before some time.
+ *
+ * Currently the REDIS_CLUSTER_BLACKLIST_TTL is set to 1 minute, this means
+ * that redis-trib has 60 seconds to send CLUSTER FORGET messages to nodes
+ * in the cluster without dealing with the problem if other nodes re-adding
+ * back the node to nodes we already sent the FORGET command to.
+ *
+ * The data structure used is an hash table with an sds string representing
+ * the node ID as key, and the time when it is ok to re-add the node as
+ * value.
+ * -------------------------------------------------------------------------- */
+
+#define REDIS_CLUSTER_BLACKLIST_TTL 60      /* 1 minute. */
+
+
+/* Before of the addNode() or Exists() operations we always remove expired
+ * entries from the black list. This is an O(N) operation but it is not a
+ * problem since add / exists operations are called very infrequently and
+ * the hash table is supposed to contain very little elements at max.
+ * However without the cleanup during long uptimes and with some automated
+ * node add/removal procedures, entries could accumulate. */
+void clusterBlacklistCleanup(void) {
+    dictIterator *di;
+    dictEntry *de;
+
+    di = dictGetSafeIterator(server.cluster->nodes_black_list);
+    while((de = dictNext(di)) != NULL) {
+        int64_t expire = dictGetUnsignedIntegerVal(de);
+
+        if (expire < server.unixtime)
+            dictDelete(server.cluster->nodes_black_list,dictGetKey(de));
+    }
+    dictReleaseIterator(di);
+}
+
+/* Cleanup the blacklist and add a new node ID to the black list. */
+void clusterBlacklistAddNode(clusterNode *node) {
+    dictEntry *de;
+    sds id = sdsnewlen(node->name,REDIS_CLUSTER_NAMELEN);
+
+    clusterBlacklistCleanup();
+    if (dictAdd(server.cluster->nodes_black_list,id,NULL) == DICT_ERR)
+        sdsfree(id); /* Key was already there. */
+    de = dictFind(server.cluster->nodes_black_list,node->name);
+    dictSetUnsignedIntegerVal(de,time(NULL));
+}
+
+/* Return non-zero if the specified node ID exists in the blacklist.
+ * You don't need to pass an sds string here, any pointer to 40 bytes
+ * will work. */
+int clusterBlacklistExists(char *nodeid) {
+    sds id = sdsnewlen(nodeid,REDIS_CLUSTER_NAMELEN);
+    int retval;
+
+    retval = dictFind(server.cluster->nodes_black_list,id) != NULL;
+    sdsfree(id);
+    return retval;
 }
 
 /* -----------------------------------------------------------------------------
@@ -1681,7 +1752,8 @@ void clusterSendFailoverAuthIfNeeded(clusterNode *node, clusterMsg *request) {
 
     /* IF we are not a master serving at least 1 slot, we don't have the
      * right to vote, as the cluster size in Redis Cluster is the number
-     * of masters serving at least one slot, and quorum is the cluster size + 1 */
+     * of masters serving at least one slot, and quorum is the cluster
+     * size + 1 */
     if (!(server.cluster->myself->flags & REDIS_NODE_MASTER)) return;
     if (server.cluster->myself->numslots == 0) return;
 
@@ -1702,9 +1774,9 @@ void clusterSendFailoverAuthIfNeeded(clusterNode *node, clusterMsg *request) {
     if (mstime() - node->slaveof->voted_time < server.cluster_node_timeout * 2)
         return;
 
-    /* The slave requesting the vote must have a configEpoch for the claimed slots
-     * that is >= the one of the masters currently serving the same slots in the
-     * current configuration. */
+    /* The slave requesting the vote must have a configEpoch for the claimed
+     * slots that is >= the one of the masters currently serving the same
+     * slots in the current configuration. */
     for (j = 0; j < REDIS_CLUSTER_SLOTS; j++) {
         if (bitmapTestBit(claimed_slots, j) == 0) continue;
         if (server.cluster->slots[j] == NULL ||
@@ -1735,7 +1807,8 @@ void clusterHandleSlaveFailover(void) {
     int needed_quorum = (server.cluster->size / 2) + 1;
     int j;
 
-    /* Set data_age to the number of seconds we are disconnected from the master. */
+    /* Set data_age to the number of seconds we are disconnected from
+     * the master. */
     if (server.repl_state == REDIS_REPL_CONNECTED) {
         data_age = (server.unixtime - server.master->lastinteraction) * 1000;
     } else {
@@ -1765,8 +1838,7 @@ void clusterHandleSlaveFailover(void) {
         return;
 
     /* Compute the time at which we can start an election. */
-    if (server.cluster->failover_auth_time == 0 ||
-        auth_age >
+    if (auth_age >
         server.cluster_node_timeout * REDIS_CLUSTER_FAILOVER_AUTH_RETRY_MULT)
     {
         server.cluster->failover_auth_time = mstime() +
@@ -1775,7 +1847,8 @@ void clusterHandleSlaveFailover(void) {
             random() % 500; /* Random delay between 0 and 500 milliseconds. */
         server.cluster->failover_auth_count = 0;
         server.cluster->failover_auth_sent = 0;
-        redisLog(REDIS_WARNING,"Start of election delayed for %lld milliseconds.",
+        redisLog(REDIS_WARNING,
+            "Start of election delayed for %lld milliseconds.",
             server.cluster->failover_auth_time - mstime());
         return;
     }
@@ -1784,8 +1857,7 @@ void clusterHandleSlaveFailover(void) {
     if (mstime() < server.cluster->failover_auth_time) return;
 
     /* Return ASAP if the election is too old to be valid. */
-    if (mstime() - server.cluster->failover_auth_time > server.cluster_node_timeout)
-        return;
+    if (auth_age > server.cluster_node_timeout) return;
 
     /* Ask for votes if needed. */
     if (server.cluster->failover_auth_sent == 0) {
@@ -1827,7 +1899,8 @@ void clusterHandleSlaveFailover(void) {
         }
 
         /* 3) Update my configEpoch to the epoch of the election. */
-        server.cluster->myself->configEpoch = server.cluster->failover_auth_epoch;
+        server.cluster->myself->configEpoch =
+            server.cluster->failover_auth_epoch;
 
         /* 4) Update state and save config. */
         clusterUpdateState();
